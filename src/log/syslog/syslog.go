@@ -13,7 +13,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -74,14 +73,14 @@ const (
 
 // A Writer is a connection to a syslog server.
 type Writer struct {
-	priority Priority
-	tag      string
-	hostname string
-	network  string
-	raddr    string
-
-	mu   sync.Mutex // guards conn
-	conn serverConn
+	priority     Priority
+	tag          string
+	hostname     string
+	network      string
+	raddr        string
+	conn         serverConn
+	messageQueue chan messageItem
+	closeSignal  chan chan error
 }
 
 // This interface and the separate syslog_unix.go file exist for
@@ -98,6 +97,11 @@ type serverConn interface {
 type netConn struct {
 	local bool
 	conn  net.Conn
+}
+
+type messageItem struct {
+	msg string
+	p   Priority
 }
 
 // New establishes a new connection to the system log daemon. Each
@@ -126,25 +130,41 @@ func Dial(network, raddr string, priority Priority, tag string) (*Writer, error)
 	hostname, _ := os.Hostname()
 
 	w := &Writer{
-		priority: priority,
-		tag:      tag,
-		hostname: hostname,
-		network:  network,
-		raddr:    raddr,
+		priority:     priority,
+		tag:          tag,
+		hostname:     hostname,
+		network:      network,
+		raddr:        raddr,
+		messageQueue: make(chan messageItem, 100),
+		closeSignal:  make(chan chan error),
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	err := w.connect()
 	if err != nil {
 		return nil, err
 	}
-	return w, err
+	go w.reporter()
+	return w, nil
+}
+
+// reporter is called in its own go-routine to handle reconnection, and rewriting logic.
+func (w *Writer) reporter() {
+	var networkError error
+	for {
+		select {
+		case msg := <-w.messageQueue:
+			w.networkWrite(msg.p, msg.msg)
+		case msg := <-w.closeSignal:
+			msg <- networkError
+			return
+		default:
+			// sharing is caring
+			time.Sleep(time.Millisecond * 4)
+		}
+	}
 }
 
 // connect makes a connection to the syslog server.
-// It must be called with w.mu held.
 func (w *Writer) connect() (err error) {
 	if w.conn != nil {
 		// ignore err from close, it makes sense to continue anyway
@@ -170,95 +190,92 @@ func (w *Writer) connect() (err error) {
 	return
 }
 
-// Write sends a log message to the syslog daemon.
-func (w *Writer) Write(b []byte) (int, error) {
-	return w.writeAndRetry(w.priority, string(b))
+// Write enqueues data to be logged remotely
+func (w *Writer) Write(data []byte) (int, error) {
+	w.messageQueue <- messageItem{msg: string(data), p: w.priority}
+	return len(data), nil
 }
 
 // Close closes a connection to the syslog daemon.
 func (w *Writer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.conn != nil {
-		err := w.conn.close()
-		w.conn = nil
-		return err
-	}
-	return nil
+	collectCloseError := make(chan error)
+	w.closeSignal <- collectCloseError
+	return <-collectCloseError
 }
 
 // Emerg logs a message with severity LOG_EMERG, ignoring the severity
 // passed to New.
 func (w *Writer) Emerg(m string) error {
-	_, err := w.writeAndRetry(LOG_EMERG, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_EMERG}
+	return nil
 }
 
 // Alert logs a message with severity LOG_ALERT, ignoring the severity
 // passed to New.
 func (w *Writer) Alert(m string) error {
-	_, err := w.writeAndRetry(LOG_ALERT, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_ALERT}
+	return nil
 }
 
 // Crit logs a message with severity LOG_CRIT, ignoring the severity
 // passed to New.
 func (w *Writer) Crit(m string) error {
-	_, err := w.writeAndRetry(LOG_CRIT, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_CRIT}
+	return nil
 }
 
 // Err logs a message with severity LOG_ERR, ignoring the severity
 // passed to New.
 func (w *Writer) Err(m string) error {
-	_, err := w.writeAndRetry(LOG_ERR, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_ERR}
+	return nil
 }
 
 // Warning logs a message with severity LOG_WARNING, ignoring the
 // severity passed to New.
 func (w *Writer) Warning(m string) error {
-	_, err := w.writeAndRetry(LOG_WARNING, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_WARNING}
+	return nil
 }
 
 // Notice logs a message with severity LOG_NOTICE, ignoring the
 // severity passed to New.
 func (w *Writer) Notice(m string) error {
-	_, err := w.writeAndRetry(LOG_NOTICE, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_NOTICE}
+	return nil
 }
 
 // Info logs a message with severity LOG_INFO, ignoring the severity
 // passed to New.
 func (w *Writer) Info(m string) error {
-	_, err := w.writeAndRetry(LOG_INFO, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_INFO}
+	return nil
 }
 
 // Debug logs a message with severity LOG_DEBUG, ignoring the severity
 // passed to New.
 func (w *Writer) Debug(m string) error {
-	_, err := w.writeAndRetry(LOG_DEBUG, m)
-	return err
+	w.messageQueue <- messageItem{msg: m, p: LOG_DEBUG}
+	return nil
 }
 
-func (w *Writer) writeAndRetry(p Priority, s string) (int, error) {
+// networkWrite will attempt to reconnect infinitely
+func (w *Writer) networkWrite(p Priority, s string) {
 	pr := (w.priority & facilityMask) | (p & severityMask)
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.conn != nil {
-		if n, err := w.write(pr, s); err == nil {
-			return n, err
+	var err error
+	for {
+		if w.conn == nil || err != nil {
+			err = w.connect()
+			// check error
+			continue
 		}
+		_, err = w.write(pr, s)
+		if err != nil {
+			// attempt to reconnect/resend
+			continue
+		}
+		return
 	}
-	if err := w.connect(); err != nil {
-		return 0, err
-	}
-	return w.write(pr, s)
 }
 
 // write generates and writes a syslog formatted string. The
